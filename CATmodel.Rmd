@@ -1,0 +1,614 @@
+---
+title: "CAT Risk and Florida CAT Claims"
+output: html_document
+date: "2026-02-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data Cleaning
+# Load libraries
+```{r, message = FALSE}
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(readxl)
+library(ggplot2)
+library(fitdistrplus)
+library(tidycensus)
+library(zipcodeR)
+```
+
+# Read and Load data
+
+The HURDAT2 dataset (21 columns, 55230 rows) provides storm position and intensity at six-hour intervals. While the data includes detailed wind-field information (column 9-21), this study focuses on storm frequency and maximum sustained wind speed, which are sufficient proxies for hurricane severity in an insurance loss modeling context.
+
+NOTE: This is the base hurricane storm set; essential to get annual frequencies used in hurricane model validation.
+
+```{r, message = FALSE}
+# url <- "https://www.nhc.noaa.gov/data/hurdat/hurdat2-1851-2024-040425.txt"
+lines <- read_excel("HURDAT2.xlsx", col_names = FALSE)
+```
+
+## Explaining columns
+1. id = Basin (AL) + Storm # (04) + Year (1980)
+2. Status:
+TD = Tropical Depression,
+TS = Tropical Storm,
+HU = Hurricane,
+EX = Extratropical Cyclone,
+LO = Low pressure system,
+DB = Disturbance,
+SS = Subtropical Storm,
+SD = Subtropical Depression,
+WV = Tropical Wave
+3. record_id: landfall flag is in here
+
+# Clean Data
+```{r, message = FALSE}
+dt <- list()
+storm_name <- NA
+storm_id <-NA
+for (i in 1:nrow(lines)) {
+  l <- lines[i, ]
+  if (str_detect(l, "^\\s*AL")) {
+    storm <- str_split(l, ",")[[1]]
+    storm_id <- str_trim(storm[1])
+    storm_name <- str_trim(storm[2])
+  } else {
+    storm <- str_split(l, ",")[[1]]
+    dt[[length(dt) + 1]] <- data.frame(
+      id         = storm_id,
+      name       = storm_name,
+      date       = str_trim(storm[1]),
+      time       = str_trim(storm[2]),
+      record_id  = str_trim(storm[3]),
+      status     = str_trim(storm[4]),
+      lat        = str_trim(storm[5]),
+      long       = str_trim(storm[6]),
+      wind       = as.numeric(str_trim(storm[7])),
+      pressure   = as.numeric(str_trim(storm[8])),
+      
+      # 34-kt wind radii
+      ne34       = as.numeric(str_trim(storm[9])),
+      se34       = as.numeric(str_trim(storm[10])),
+      sw34       = as.numeric(str_trim(storm[11])),
+      nw34       = as.numeric(str_trim(storm[12])),
+      
+      # 50-kt wind radii
+      ne50       = as.numeric(str_trim(storm[13])),
+      se50       = as.numeric(str_trim(storm[14])),
+      sw50       = as.numeric(str_trim(storm[15])),
+      nw50       = as.numeric(str_trim(storm[16])),
+      
+      # 64-kt wind radii
+      ne64       = as.numeric(str_trim(storm[17])),
+      se64       = as.numeric(str_trim(storm[18])),
+      sw64       = as.numeric(str_trim(storm[19])),
+      nw64       = as.numeric(str_trim(storm[20])),
+      
+      # Radius of max wind
+      r_max_wind = as.numeric(str_trim(storm[21]))
+    )
+  }
+}
+
+hurdat <- bind_rows(dt)
+```
+
+```{r, message = FALSE}
+tail(hurdat)
+```
+
+
+Due to advances in aircraft reconnaissance, data after 1944 is considered more reliable (?). Also keeping Florida data.
+```{r, message = FALSE}
+hurdat_cl <- hurdat %>% 
+  mutate(status = str_trim(status),
+    date = ymd(date),
+    year = year(date),
+    month = month(date),
+    day = day(date),
+    lat = case_when(str_ends(str_trim(lat),  "N") ~  as.numeric(str_remove(str_trim(lat),  ".$")),
+      str_ends(str_trim(lat),  "S") ~ -as.numeric(str_remove(str_trim(lat),  ".$"))),
+    long = case_when(str_ends(str_trim(long), "W") ~ -as.numeric(str_remove(str_trim(long), ".$")),
+      str_ends(str_trim(long), "E") ~  as.numeric(str_remove(str_trim(long), ".$"))),
+    wind_mph = wind * 1.15078,
+    pressure = na_if(pressure, -999),
+    pressure = na_if(pressure, 0),
+    across(ne34:r_max_wind, ~ na_if(.x, -999)))  %>% 
+  filter(year >= 1900,
+         status %in% c("HU", "TS", "SS"))
+```
+
+```{r, message = FALSE}
+head(hurdat_cl)
+```
+
+```{r, message = FALSE}
+storm_summary <- hurdat_cl %>%
+  group_by(id, name, year) %>%
+  summarise(
+    peak_wind_mph = max(wind_mph, na.rm = TRUE),
+    min_pressure = min(pressure, na.rm = TRUE),
+    peak_month = month[which.max(wind_mph)],
+    peak_status = case_when(
+      any(status == "HU") ~ "HU",
+      any(status == "SS") ~ "SS",
+      TRUE ~ "TS"
+    ),
+    landfall = any(record_id=="L"),
+    mean_r34 = mean(c(ne34, se34, sw34, nw34), na.rm = TRUE),
+    mean_r64 = mean(c(ne64, se64, sw64, nw64), na.rm = TRUE),
+    r_max_wind = mean(r_max_wind, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+Filter out Florida storms
+```{r, message = FALSE}
+florida_ids <- hurdat_cl %>%
+  filter(lat  >= 23.0 & lat  <= 32.0,
+         long >= -88.0 & long <= -79.0) %>%
+  distinct(id)
+
+florida_summary <- storm_summary %>%
+  semi_join(florida_ids, by = "id")
+```
+
+
+
+# EDA
+## Wind
+Saffir-Simpson Hurricane Wind Scale (1):
+
+Category    Winds (mph)   Damage
+1           74 – 95       Minimal
+2           96 – 110      Moderate
+3           111 – 129     Extensive
+4           130 – 156     Extreme
+5           >157          Catastrophic
+```{r, echo=FALSE, message=FALSE}
+# Catergorize by Saffir-Simpson Scale
+florida_summary <- florida_summary %>%
+  mutate(
+    category = case_when(
+      peak_wind_mph >= 157 ~ "Cat 5",
+      peak_wind_mph >= 130 & peak_wind_mph < 157 ~ "Cat 4",
+      peak_wind_mph >= 111 & peak_wind_mph < 130 ~ "Cat 3",
+      peak_wind_mph >= 96  & peak_wind_mph < 111 ~ "Cat 2",
+      peak_wind_mph >= 74  & peak_wind_mph < 96 ~ "Cat 1",
+      peak_wind_mph >= 39  & peak_wind_mph < 74 ~ "TS",
+      TRUE ~ "TD"
+    ),
+    # Order the factor for plotting
+    category = factor(category, 
+                      levels = c("TD", "TS", "Cat 1", "Cat 2", 
+                                 "Cat 3", "Cat 4", "Cat 5"))
+  )
+
+
+storm_summary <- storm_summary %>%
+  mutate(
+    category = case_when(
+      peak_wind_mph >= 157 ~ "Cat 5",
+      peak_wind_mph >= 130 & peak_wind_mph < 157 ~ "Cat 4",
+      peak_wind_mph >= 111 & peak_wind_mph < 130 ~ "Cat 3",
+      peak_wind_mph >= 96  & peak_wind_mph < 111 ~ "Cat 2",
+      peak_wind_mph >= 74  & peak_wind_mph < 96 ~ "Cat 1",
+      peak_wind_mph >= 39  & peak_wind_mph < 74 ~ "TS",
+      TRUE ~ "TD"
+    ),
+    # Order the factor for plotting
+    category = factor(category, 
+                      levels = c("TD", "TS", "Cat 1", "Cat 2", 
+                                 "Cat 3", "Cat 4", "Cat 5"))
+  )
+```
+
+```{r, echo=FALSE, message=FALSE}
+# Category distribution
+florida_summary %>%
+  count(category) %>%
+  ggplot(aes(x = category, y = n, fill = category)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c(
+    "TD"    = "gray",
+    "TS"    = "steelblue",
+    "Cat 1" = "yellow",
+    "Cat 2" = "orange",
+    "Cat 3" = "darkorange",
+    "Cat 4" = "red",
+    "Cat 5" = "darkred"
+  )) +
+  labs(title = "Florida Storms by Saffir-Simpson Category")
+
+
+storm_summary %>%
+  count(category) %>%
+  ggplot(aes(x = category, y = n, fill = category)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c(
+    "TD"    = "gray",
+    "TS"    = "steelblue",
+    "Cat 1" = "yellow",
+    "Cat 2" = "orange",
+    "Cat 3" = "darkorange",
+    "Cat 4" = "red",
+    "Cat 5" = "darkred"
+  )) +
+  labs(title = "Atlantic Storms by Saffir-Simpson Category")
+```
+```{r}
+library(diptest)
+dip.test(storm_summary$peak_wind_mph)
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+# Peak wind distributions
+ggplot(florida_summary, aes(x = peak_wind_mph, fill = peak_status)) +
+  geom_bar(position = "stack") +
+  labs(title = "Peak Wind Distribution of Florida storms")
+```
+
+## Storm count
+Overall number storms by status
+```{r, echo=FALSE, message=FALSE}
+florida_summary %>% count(peak_status)
+```
+
+Overall number of landfall
+```{r, echo=FALSE, message=FALSE}
+florida_summary %>%  count(landfall)
+```
+
+```{r, include=FALSE, message=FALSE}
+annual_counts_at <- storm_summary %>% count(year)
+m_at <- mean(annual_counts_at$n)
+v_at <- var(annual_counts_at$n)
+v_at/m_at # Overdispersion of Atlantic storm count
+
+
+annual_counts_fl <- florida_summary %>% count(year)
+m_fl <- mean(annual_counts_fl$n)
+v_fl <- var(annual_counts_fl$n)
+v_fl/m_fl # Overdispersion of Florida storm count
+
+
+annual_counts_lf <- florida_summary %>% filter(landfall == TRUE) %>% count(year)
+m_lf <- mean(annual_counts_lf$n)
+v_lf <- var(annual_counts_lf$n)
+v_lf/m_lf # Overdispersion of Florida landfall count
+```
+
+Plots on storm count per year (red line is the avarage)
+```{r, echo=FALSE, message=FALSE}
+storm_summary %>% 
+  count(year) %>% 
+  ggplot(aes(x = year, y = n)) +
+  geom_bar(stat = "identity") +
+  geom_line(aes(y = m_at, colour = "red")) +
+  labs(title = "Storm count per year in Atlantic Basin")
+```
+
+```{r}
+florida_summary %>% 
+  count(year) %>% 
+  ggplot(aes(x = year, y = n)) +
+  geom_bar(stat = "identity") +
+  geom_line(aes(y = m_fl, colour = "red")) +
+  labs(title = "Storm count per year in Florida")
+```
+"The Poisson assumption is supported by historical data. The Poisson rates are in good agreement with historical data" (1)
+
+Poisson is a good choice since Florida's overdispersion is near 1 (i.e. mean = variance). Also, looking at the distribution, number of storms varies randomly, and knowing about past storm count says nothing about future storm count (memoryless property).
+
+NOTE: if overdispersion >> 1 (i.e. some years has more storms than others; fat tail), choose Neg Bin
+
+
+## Landfall
+```{r}
+florida_summary %>% 
+  filter(landfall == TRUE) %>% 
+  count(year) %>% 
+  ggplot(aes(x = year, y = n)) +
+  geom_bar(stat = "identity") +
+  geom_line(aes(y = m_lf, colour = "red")) +
+  labs(title = "Landfall per year in Florida", color = "Mean")
+```
+```{r}
+landfall_region <- hurdat_cl %>% 
+  filter(record_id == "L") %>% 
+  mutate(region = case_when(
+    lat >= 29.5 ~ "Panhandle",
+    lat >= 27.5 & lat < 29.5 ~ "North Florida",
+    lat >= 25.5 & lat < 27.5 ~ "Central Florida",
+    lat <  25.5 ~ "South Florida"
+  ))
+
+landfall_region %>%  count(region, year) %>% 
+  ggplot(aes(x = year, y = n, colour = region)) +
+  geom_line()
+```
+South Florida > Panhandle > North Florida > Central Florida
+
+```{r}
+# How severe?
+florida_summary %>% 
+  left_join(landfall_region %>% 
+              dplyr::select(id, region), by = "id") %>% 
+  group_by(region) %>% 
+  summarise(n = n(),
+            mean_wind = mean(peak_wind_mph),
+            major_storm = mean(category %in% c("Cat 3","Cat 4","Cat 5")) * 100) #percentage of major storms
+```
+
+```{r}
+# Forward Speed + Track direction
+
+landfall_details <- hurdat_cl %>%
+  filter(record_id == "L",
+         lat >= 23.0 & lat <= 32.0,
+         long >= -88.0 & long <= -79.0) %>%
+  group_by(id) %>%
+  slice(1) %>%
+  dplyr::select(id, lat, long, wind_mph, pressure, r_max_wind)
+
+head(landfall_details)
+```
+
+
+## Seasonality
+```{r, echo=FALSE, message=FALSE}
+florida_summary %>% 
+  count(peak_month, peak_status) %>% 
+  ggplot(aes(x=peak_month, y = n, fill = peak_status)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_x_continuous(breaks = 1:12) +
+  labs(title = "Florida Storm Count by Month and Status")
+```
+
+```{r, echo=FALSE, message=FALSE}
+# Category by month
+florida_summary %>%
+  count(peak_month, category) %>%
+  ggplot(aes(x = peak_month, y = n, fill = category)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_x_continuous(breaks = 1:12) +
+  scale_fill_manual(values = c(
+    "TD"    = "gray",
+    "TS"    = "steelblue",
+    "Cat 1" = "yellow",
+    "Cat 2" = "orange",
+    "Cat 3" = "darkorange",
+    "Cat 4" = "red",
+    "Cat 5" = "darkred"
+  )) +
+  labs(title = "Storm Severity by Month")
+```
+
+How it has changed through years?
+
+```{r, echo=FALSE, message=FALSE}
+florida_summary %>% 
+  mutate(era = case_when(year < 1950 ~ "1900-1949",
+                        year < 2000 ~ "1950-1999",
+                        TRUE ~ "2000-present")) %>% 
+  count(era, peak_month) %>% 
+  group_by(era) %>% 
+  mutate(storm_count = n/sum(n)) %>% 
+  ggplot(aes(x=peak_month, y=storm_count, fill=era)) +
+  geom_bar(stat = "identity", position = "dodge") + 
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(title = "Seasonal Storm Count by Era")
+```
+
+```{r, echo=FALSE, message=FALSE}
+florida_summary %>%
+  mutate(era = case_when(
+    year < 1950 ~ "1900-1949",
+    year < 2000 ~ "1950-1999",
+    TRUE        ~ "2000-present"
+  )) %>%
+  count(era, category) %>%
+  group_by(era) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = category, y = prop, fill = category)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ era) +
+  scale_fill_manual(values = c(
+    "TS"    = "steelblue",
+    "Cat 1" = "yellow",
+    "Cat 2" = "orange",
+    "Cat 3" = "darkorange",
+    "Cat 4" = "red",
+    "Cat 5" = "darkred"
+  )) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Storm Category Proportion by Era",
+       x = "Category", y = "Proportion")
+```
+
+## Overall
+- Overall, TS has highest frequency, following by CAT 1, CAT 4, CAT 2. This doesn't change through eras. --> a mixture distribution for severity
+- It is clearly that storms start in 5 and peak at Month 9 in all eras. Month 8-10 have the highest frequency and severity (including CAT 5). --> conditional on peak season
+- In the span of 25 years recently, there are more CAT 5 storms happened proportionally. --> climate trend?
+
+```{r}
+ggplot(florida_summary, aes(x = peak_wind_mph)) +
+  geom_density(fill = "steelblue", alpha = 0.5, linewidth = 1) +
+  geom_vline(xintercept = c(74, 96, 111, 130, 157),
+             linetype = "dashed", color = "red", alpha = 0.7) +
+  annotate("text", x = c(85, 103, 120, 143, 170), y = 0.002,
+           label = c("Cat1", "Cat2", "Cat3", "Cat4", "Cat5"),
+           color = "red", size = 3) +
+  labs(title = "Wind Speed Density",
+       x = "Peak Wind Speed (mph)", y = "Density")
+```
+
+### Fit mixture distribution
+fits a mixture of normal distributions using the EM (Expectation-Maximization) algorithm
+k = 2 — find 2 components
+
+The algorithm iterates back and forth between:
+E step — assign each storm a probability of belonging to component 1 or 2
+M step — update the parameters (mean, sd, weight) to best fit those assignments
+Repeats until it converges on stable parameters
+
+```{r}
+library(mixtools)
+
+mix_fit <- normalmixEM(florida_summary$peak_wind_mph, k = 2)
+summary(mix_fit)
+
+# Extract parameters cleanly
+tibble(
+  component = c("Weak (TS/Cat1/Cat2)", "Intense (Cat3-5)"),
+  lambda    = mix_fit$lambda,   # mixing weights
+  mu        = mix_fit$mu,       # mean wind speed
+  sigma     = mix_fit$sigma     # standard deviation
+)
+```
+
+
+# Monte Carlo
+```{r, message = FALSE}
+# Get Poisson lambda
+fit_poisson <- fitdist(annual_counts_fl$n, "pois")
+lambda_annual <- fit_poisson$estimate["lambda"]
+```
+## Frequency
+```{r}
+set.seed(100)
+n_sim <- 100000
+
+# Number of storms per year
+annual_storm <- rpois(n_sim, lambda = lambda_annual)
+
+table(annual_storm) %>% head(10)
+```
+
+## Severity
+```{r}
+# Wind speed
+total_storm <- sum(annual_storm)
+
+component <- sample(
+  x       = 1:2,
+  size    = total_storm,
+  replace = TRUE,
+  prob    = mix_fit$lambda  # c(0.485, 0.515)
+)
+
+# Step 2b — draw wind speed from that component's normal distribution
+wind_speeds <- rnorm(
+  n    = total_storm,
+  mean = mix_fit$mu[component],     # 62 or 120 mph
+  sd   = mix_fit$sigma[component]   # 13 or 32 mph
+)
+
+# Step 2c — floor at 39 mph (minimum TS threshold)
+wind_speeds <- pmax(wind_speeds, 39)
+
+# Sanity checks
+mean(wind_speeds)
+quantile(wind_speeds, c(0.25, 0.5, 0.75, 0.90, 0.99))
+sum(wind_speeds >= 157) / total_storm  # % Cat 5 storms
+```
+
+## Vulnerability
+```{r}
+vulnerability <- function(wind_mph, construction = "masonry") {
+  params <- list(
+    manufactured = list(center = 80,  steepness = 0.12),
+    wood_frame   = list(center = 95,  steepness = 0.10),
+    masonry      = list(center = 110, steepness = 0.08)
+  )
+  p <- params[[construction]]
+  1 / (1 + exp(-p$steepness * (wind_mph - p$center)))
+}
+```
+
+
+```{r, eval=FALSE}
+census_api_key("7adee0ef167edfd313a5a87ef9a3287b3c547249", install = TRUE, overwrite = TRUE)
+```
+
+```{r}
+readRenviron("~/.Renviron")
+
+fl_exposure <- get_acs(
+  geography = "zcta",          # ZIP Code Tabulation Area
+  variables = c(
+    housing_units = "B25001_001",   # total housing units
+    median_value  = "B25077_001"    # median home value ($)
+  ),
+  year   = 2022,
+  output = "wide"
+) %>%
+  # filter to Florida ZIPs (start with 32 or 33 or 34)
+  filter(str_starts(GEOID, "32") |
+         str_starts(GEOID, "33") |
+         str_starts(GEOID, "34")) %>% 
+  transmute(
+    zip           = GEOID,
+    housing_units = housing_unitsE,
+    median_value  = median_valueE,
+    TIV           = housing_units * median_value
+  ) %>%
+  filter(!is.na(TIV), TIV > 0)
+
+nrow(fl_exposure)          # how many Florida ZIPs?
+sum(fl_exposure$TIV) / 1e9 # total insured value in billions
+fl_exposure %>% arrange(desc(TIV)) %>% head(10)  # top 10 ZIPs
+```
+
+```{r}
+zip_coords <- zip_code_db %>%
+  filter(state == "FL") %>%
+  dplyr::select(zipcode, lat, lng) %>%
+  rename(zip = zipcode, zip_lat = lat, zip_long = lng)
+
+fl_exposure <- fl_exposure %>%
+  left_join(zip_coords, by = "zip") %>%
+  filter(!is.na(zip_lat), !is.na(zip_long))
+
+# Plot
+ggplot(fl_exposure, aes(x = zip_long, y = zip_lat, color = TIV / 1e6)) +
+  geom_point(size = 0.8) +
+  scale_color_viridis_c(name = "TIV ($M)", trans = "log10") +
+  labs(title = "Florida ZIP Code Exposure (TIV)",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal()
+```
+
+```{r}
+
+```
+
+
+
+
+# NOTES
+## Distributions
+exp: (Exponential) The parameter is rate (defaults to 1). The mean of the distribution is 1/rate.
+norm: (Normal)The most famous distribution in statistics, this is the well-known “bell-curve”. Parameters of the distribution are mean (defaults to 0) and sd (defaults to 1).
+unif: (Uniform) Parameters are min (defaults to 0) and max (defaults to 1).
+binom: (Binomial) Parameters are size, the number of trials, and prob, the probability of success on a single trial (no defaults).
+geom: (Geometric) Parameter is prob, the probability of success on each independent trial. Note that the distribution is defined in terms of the number of failures before the first success.
+pois: (Poisson) The parameter is lambda, the mean.
+
+## r code chunk notation
+echo: display code in output?
+eval: run code?
+include: display code and results?
+message: display warning message?
+
+
+
+# Source
+(1) https://fchlpm.sbafla.com/media/4fdg1eyk/rms21standardsdisclosures_05192023.pdf
